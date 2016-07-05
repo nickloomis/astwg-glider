@@ -20,6 +20,9 @@ powOrder = 14;
 %[Rmin,Ridx] = minIntensityHoloCuda(C + min(C(:)) + 1e3, zpl/1000, ...
 %    658e-9, 6.8e-6, powOrder);
 
+% C : original hologram data
+% zpl : vector reconstruction planes
+%
 [simcuda, sidxcuda, rmincuda, ridxcuda] = maxSIMfm(C, zpl/1000, 658e-9, 6.8e-6, 12, .001, 2, 500);
 %takes ~5s for numel(z)=106 and npix=2048
 %takes ~30s for numel(z)=106 and npix=4096
@@ -113,8 +116,21 @@ zestrmin = interp1(1:numel(zpl),zpl,zestrminidx);
 
 %reconstruct images of the particles for estimating proper sizes
 
+% simgs : all extracted ROI images, concatenated into a single array
+% startidx : vector of starting indices
+% height : vector of heights, one entry for each ROI
+% width : vector of widths, one entry for each ROI
+%
+% Example use: get the pixels for the third image
+%  num_pixels = height(3) * width(3);
+%  end_index = startidx(3) + num_pixels - 1;
+%  image_pixels_vector = simgs(startidx(3) : end_index);
+%  roi = reshape(image_pixels_vector, [height(3), width(3)])
+
+% C: original hologoram
 margin = 10;
-[simgs, startidx, height, width] = holoExtractBBox_cuda(C, zestsim/1000, [rp.BoundingBox], margin, 658e-9, 6.8e-6, powOrder, .001);
+[simgs, startidx, height, width] = ...
+  holoExtractBBox_cuda(C, zestsim/1000, [rp.BoundingBox], margin, 658e-9, 6.8e-6, powOrder, .001);
 
 
 %estimate the sizes
@@ -131,7 +147,7 @@ meanintbkg = zeros(nb,1);
 stdintblob = zeros(nb,1);
 stdintbkg = zeros(nb,1);
 
-
+% Select oil-shaped images from the ROIs.
 for j=1:nb
     blobimg = getParticleFromSeq(simgs, startidx, height, width, j);
     sb = size(blobimg);

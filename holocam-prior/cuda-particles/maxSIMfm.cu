@@ -1,9 +1,42 @@
 
 // TODO(nloomis): TOF docs
 //
-//reconstructs a hologram on a number of planes and find the magnitude and (steerable) gradient 
-//at each depth. the maximum st_grad * (1 - mag) is recorded as a focus metric.
-
+// reconstructs a hologram on a number of planes and find the magnitude and (steerable) gradient 
+// at each depth. the maximum st_grad * (1 - mag) is recorded as a focus metric.
+//
+//
+// Overview of steps in this code:
+//
+// load image into cpu memory (raw hologram, captured by camera); the image is
+//   expected to be 2D (no RGB channels), but may be raw data from a Bayer-
+//   patterned sensor
+// transfer image from CPU to GPU memory
+//
+// take 2D FFT of the image --> fft2_of_hologram (size 2k x 2k, eg)
+//
+// for (z : reconstruction_depths) {
+//	 compute a reconstruction kernel directly in the Fourier domain (same size
+//     as fft2_of_hologram; 2k x 2k, eg)
+//   multiply fft2_of_hologram * reconstruction_kernel
+//   take Inverse 2D FFT of (fft2_of_hologram * reconstruction_kernel) 
+//     --> reconstructed_image
+//   
+//   filter reconstructed_image with a gradient filter ("steerable derivative")
+//     --> "sfiltmag" (steerable filter magnitude)
+//   inverting reconstructed_image so that objects are bright and background
+//     is dark -> dark_field_image
+//   compute a focus metric, sim = sfiltmag * dark_field_image
+//
+//   compare the value of the focus metric for this z slice against the prior
+//     best focus metric, keeping track of which z slice maximimizes the focus
+//     metric
+// }
+//
+// output from loop: map of where each pixel was best focused (same size as the
+//   hologram, eg 2k x 2k); get both the depth and how in focus the pixel was
+//
+// transfer maps from GPU to CPU memory and back to Matlab
+// 
 
 #include "mex.h"
 #include "cuda_runtime.h"
