@@ -22,10 +22,10 @@
 //     --> reconstructed_image
 //   
 //   filter reconstructed_image with a gradient filter ("steerable derivative")
-//     --> "sfiltmag" (steerable filter magnitude)
+//     --> "gradient_magnitude_gpu" (steerable filter magnitude)
 //   inverting reconstructed_image so that objects are bright and background
 //     is dark -> dark_field_image
-//   compute a focus metric, sim = sfiltmag * dark_field_image
+//   compute a focus metric, sim = gradient_magnitude_gpu * dark_field_image
 //
 //   compare the value of the focus metric for this z slice against the prior
 //     best focus metric, keeping track of which z slice maximimizes the focus
@@ -44,27 +44,24 @@
 #include "float.h"
 
 
-// Converts a double to a float and stores the result back in the dst pointer.
+// Converts a double to a float and stores the result back in the dest pointer.
 // The float is downcast, discarding the least significant bits in the double.
 //
 // This is useful because CUDA prefers floats for its computations, while
 // Matlab defaults to doubles.
-void double_to_float(float* dst, double* src, const int n) {
+void double_to_float(float* dest, double* source, const int n) {
 	for (int i = 0; i < n; ++i)
-		dst[i] = (float) src[i];
+		dest[i] = (float) source[i];
 }
-
 
 
 // Convert an unsigned char (or a uint8 in Matlab's type name scheme) to a
-// float and store the result to dst. The char is converted to the nearest
+// float and store the result to dest. The char is converted to the nearest
 // float. For example, 8 becomes 8.0. 
-void uint8_to_float(float* dst, unsigned char* src, const int n) {
+void uint8_to_float(float* dest, unsigned char* source, const int n) {
 	for (int i = 0; i < n; ++i)
-		dst[i] = (float) src[i];
+		dest[i] = (float) source[i];
 }
-
-
 
 
 // Performs integer division, but rounds up if the division is not exact.
@@ -73,7 +70,6 @@ void uint8_to_float(float* dst, unsigned char* src, const int n) {
 int roundUpDiv(int num, int denom) {
 	return (num / denom) + (!(num % denom) ? 0 : 1);
 }
-
 
 
 // Returns a * b, where a and b are complex-valued floats.
@@ -86,12 +82,9 @@ __device__ cufftComplex complexMult32(cufftComplex a, cufftComplex b) {
 }
 
 
-
-
 // Returns a * sc, where a is a complex-valued float and sc is a scalar.
 // This device kernel can only runs on a CUDA device.
-__device__ cufftComplex complexScale32(cufftComplex a, float sc)
-{
+__device__ cufftComplex complexScale32(cufftComplex a, float sc) {
 	cufftComplex tempResult;
 	tempResult.x = a.x*sc;
 	tempResult.y = a.y*sc;
@@ -101,9 +94,8 @@ __device__ cufftComplex complexScale32(cufftComplex a, float sc)
 
 // Returns the magnitude of the complex-valued float, a.
 // This device kernel only runs on a CUDA device.
-__device__ float complexMagnitude(float2 a)
-{
-	return sqrtf( a.x*a.x + a.y*a.y );
+__device__ float complexMagnitude(float2 a) {
+	return sqrtf( a.x * a.x + a.y * a.y );
 }
 
 
@@ -140,7 +132,7 @@ __device__ float complexMagnitude(float2 a)
 // expected to use the size and index information to determine which data
 // elements it needs to access. All the kernels here use a similar pattern:
 //
-//   static __global__ void DeviceKernel(T* dst, U* src,
+//   static __global__ void DeviceKernel(T* dest, U* source,
 //                                       additional args...,
 //                                       const int M, const int N) {
 //     // Find the pixel that this thread is responsible for computing, in
@@ -153,78 +145,65 @@ __device__ float complexMagnitude(float2 a)
 //     // occur otherwise.
 //     if (xidx < N && yidx < M) {
 //       int idx = yidx * N + xidx;
-//       // Compute something using data from src[idx] and storing back to
-//       // dst[idx].
+//       // Compute something using data from source[idx] and storing back to
+//       // dest[idx].
 //     }
 //   }
 //
 
 
-// Converts a float to a complex float, storing the result into dst. The real
-// part of dst is copied from src, while the imaginary part is set to zero. The
-// size of the src array is M rows and N columns.
-static __global__ void float_to_complexKernel(float2* dst, float* src,
+// Converts a float to a complex float, storing the result into dest. The real
+// part of dest is copied from source, while the imaginary part is set to zero. The
+// size of the source array is M rows and N columns.
+static __global__ void float_to_complexKernel(float2* dest, float* source,
                                               const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M){
 		// Index of the data in the array.
 		int idx = yidx * N + xidx;
-		// dst.x is the real component.
-		dst[idx].x = src[idx];
+		// dest.x is the real component.
+		dest[idx].x = source[idx];
 		// des.y is the imaginary component.
-		dst[idx].y = 0;
+		dest[idx].y = 0;
 	}
 }
 
 
-
-/*
-static __global__ void fillFloatKernel(float* dst, const float value, 
-									   const int M, const int N)
-{
-	int xidx = threadIdx.x + blockDim.x*blockIdx.x;
-	int yidx = threadIdx.y + blockDim.y*blockIdx.y;
-	if (xidx<N && yidx<M){
-		dst[yidx*N+xidx] = value;
-	}
-}
-*/
-
-// In-place multiplication. The dst is a pointer to an array with size M rows
-// and N columns; each value in dst is multipled by the constant scalar, sc.
-static __global__ void scaleFloatKernel(float* dst, const float sc,
+// In-place multiplication. The dest is a pointer to an array with size M rows
+// and N columns; each value in dest is multipled by the constant scalar, sc.
+static __global__ void scaleFloatKernel(float* dest, const float sc,
                                         const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M){
 		int idx = yidx * N + xidx;
-		dst[idx] = dst[idx] * sc;
+		dest[idx] = dest[idx] * sc;
 	}
 }
 
 
-// Copies the real part of the value in csrc and stores it to dst. Both csrc
-// and dst have M rows and N columns.
-static __global__ void copyRealKernel(float* dst, float2* csrc,
+// Copies the real part of the value in csrc and stores it to dest. Both csrc
+// and dest have M rows and N columns.
+static __global__ void copyRealKernel(float* dest, float2* csrc,
                                       const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M){
 		int idx = yidx * N + xidx;
-		dst[idx] = csrc[idx].x;
+		dest[idx] = csrc[idx].x;
 	}
 }
 
-// Computes the magnitude of the complex-valued csrc pixel and stores it to dst.
-// Both csrc and dst have M rows and N columns.
-static __global__ void copyMagnitudeKernel(float* dst, float2* csrc,
+// Computes the magnitude of the complex-valued csrc pixel and stores it to dest.
+// Both csrc and dest have M rows and N columns.
+static __global__ void copyMagnitudeKernel(float* dest, float2* csrc,
                                            const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M){
 		int idx = yidx * N + xidx;
-		dst[idx] = complexMagnitude(csrc[idx]);
+		dest[idx] = complexMagnitude(csrc[idx]);
 	}
 }
 
@@ -238,10 +217,25 @@ static __global__ void copyMagnitudeKernel(float* dst, float2* csrc,
 //
 // This kernel is used for finding which z-plane maximimzes a focus metric.
 //
+// Arguments:
+//  max_metric : the current maximum value of the focus metric at each pixel;
+//               if the new slice has a higher metric, the value replaces the
+//               entry in max_metric.
+//  index_of_max : an index recording the slice where the maximum metric
+//               occurred. If the new slice's metric is larger than the
+//               current maximum, the index associed with the new slice replaces
+//               the entry in index_of_max.
+//  slice_metric : a focus metric computed for a new reconstruction slice. If
+//               slice_metric > max_metric, slice_metric replaces max_metric and
+//               slice_index is stored to index_of_max.
+//  slice_index : an index associated with the current slice, used to refer
+//               back to the particular reconstruction.
+//  M, N: max_metric, index_of_max, and slice_metric all have M rows and N
+//               columns.
 static __global__ void compareRealKernel(float* max_metric,
                                          short* index_of_max,
                                          float* slice_metric,
-                                         const int comparison_index,
+                                         const int slice_index,
                                          const int M,
                                          const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -252,95 +246,142 @@ static __global__ void compareRealKernel(float* max_metric,
 		float oldreal = max_float[idx];
 		max_metric[idx] = newreal > oldreal ? newreal : oldreal;
 		index_of_max[idx] = newreal > oldreal ?
-			                (short) comparison_index : index_of_max[idx];
+			                (short) slice_index : index_of_max[idx];
 	}
 }
 
 
-//finds the larger of the two; this is the overloaded version that stores the intensity at the max sim as well.
-// Compares a 
-static __global__ void compareRealKernel(float* max_metric, short* index_of_max_metric, float* slice_metric, float* intensity_at_max_metric, float2* slice_intensity,
-										  const int slice_index, const int M, const int N) {
-	int xidx = threadIdx.x + blockDim.x*blockIdx.x;
-	int yidx = threadIdx.y + blockDim.y*blockIdx.y;
-	if (xidx<N && yidx<M){
-		int idx = yidx*N+xidx;
+// Compares the focus metric of a reconstruction slice against the current
+// maximum focus metric. If the pixel has a higher focus metric, the slice's
+// focus metric, the slice's reconstruction intensity*, and the slice's
+// reference index replace the values in max_metric, intensity_at_max_metric,
+// and index_of_max_metric.
+//
+// This kernel is used to find the slice where the focus metric maximizes and
+// the resulting intensity on that slice.
+//
+// *Reconstructions have both a real part and a complex part. The true intensity
+// corresponds to the magnitude of the reconstruction. Because of the way
+// propagation_kernels calculates the phase offset, the real component reflects
+// most of the variation which occurs in intensity. It also requires fewer
+// computations than the magnitude, and looks better to an observer. This
+// function copies the real component into the intensity_at_max_metric array.
+static __global__ void compareRealKernel(float* max_metric,
+                                         short* index_of_max_metric,
+                                         float* slice_metric,
+                                         float* intensity_at_max_metric,
+                                         float2* slice_intensity,
+										 const int slice_index,
+										 const int M,
+										 const int N) {
+	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
+	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
+	if (xidx < N && yidx < M){
+		int idx = yidx * N + xidx;
 		float newreal = slice_metric[idx];
 		float oldreal = max_metric[idx];
 		max_metric[idx] = (newreal > oldreal ? newreal : oldreal);
-		index_of_max_metric[idx] = (newreal > oldreal ? (short) slice_index : index_of_max_metric[idx]);
+		index_of_max_metric[idx] = (newreal > oldreal ?
+		                           (short) slice_index :
+		                           index_of_max_metric[idx]);
 		// If the focus metric is higher at this slice, record the intensity
 		// (or, as a proxy, the real component in the x field) of this slice's
 		// reconstruction; if not, keep the value the same.
 		intensity_at_max_metric[idx] = (newreal > oldreal ?
-		    slice_intensity[idx].x :
-		    intensity_at_max_metric[idx]);
+		                               slice_intensity[idx].x :
+		                               intensity_at_max_metric[idx]);
 	}
 }
 
-
-
-
-//finds the smaller of the two
-static __global__ void compareReal2Kernel(float* rintdev, short* ridxdev, float2* recdev,
-										  const int i, const int M, const int N)
-{
-	int xidx = threadIdx.x + blockDim.x*blockIdx.x;
-	int yidx = threadIdx.y + blockDim.y*blockIdx.y;
-	if (xidx<N && yidx<M){
-		int idx = yidx*N+xidx;
-		float newreal = recdev[idx].x;
-		float oldreal = rintdev[idx];
-		rintdev[idx] = (newreal < oldreal ? newreal : oldreal);
-		ridxdev[idx] = (newreal < oldreal ? (short)i : ridxdev[idx]);
+ 
+// Compares the real value of a reconstruction slice against the smallest known
+// real value of previous reconstructions. If the slice's value is smaller, the
+// slice's value and the index of the slice overwrite the entries in the
+// minimum_real and index_at_min arrays. The arrays all have M rows and N
+// columns.
+static __global__ void compareReal2Kernel(float* minimum_real,
+                                          short* index_at_min,
+                                          float2* reconstructed_slice,
+										  const int slice_index,
+										  const int M, const int N) {
+	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
+	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
+	if (xidx < N && yidx < M){
+		int idx = yidx * N + xidx;
+		float slice_real_value = reconstructed_slice[idx].x;
+		float current_minimum = minimum_real[idx];
+		minimum_real[idx] = (slice_real_value < current_minimum ?
+		                     slice_real_value :
+		                     oldreal);
+		index_at_min[idx] = (slice_real_value < current_minimum ?
+		                    (short) slice_index :
+		                    index_at_min[idx]);
 	}
 }
-
 
 
 // In-place computation of the magnitude of a complex number. The arrray of
-// complex numbers, src, has M rows and N columns. The magnitude of src is
-// stored back to the real part of src, and the imaginary part is set to zero.
-static __global__ void computeMagKernel(float2* src, const int M, const int N) {
+// complex numbers, source, has M rows and N columns. The magnitude of source is
+// stored back to the real part of source, and the imaginary part is set to zero.
+static __global__ void computeMagKernel(float2* source,
+                                        const int M,
+                                        const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M) {
 		int idx = yidx * N + xidx;
-		src[idx].x = complexMagnitude(src[idx]);
-		src[idx].y = 0;
+		source[idx].x = complexMagnitude(source[idx]);
+		source[idx].y = 0;
 	}
 }
 
-
-
-
-static __global__ void complexMultKernel(float2* dst,
-                                         float2* src1, float2* src2,
-                                         const int M, const int N) {
+// Multiplies arrays of complex numbers in source1 and source2 and stores the
+// result to dest. The arrays all have M rows and N columns.
+static __global__ void ComplexMultiplicationKernel(float2* dest,
+                                                   float2* source1,
+                                                   float2* source2,
+                                                   const int M,
+                                                   const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M) {
 		int idx = yidx * N + xidx;
-		dst[idx] = complexMult32(src1[idx], src2[idx]);
+		dest[idx] = complexMult32(source1[idx], source2[idx]);
 	}
 }
 
 
-
-// sfiltmag: magnitude of a steerable filter; output
-// sx: x-direction response of image convolved with steerable filter
-// sy: y-direction response of image convolved with steerable filter
-// M: number of rows in sfiltmag, sx, and sy
-// N: number of cols in sfiltmag, sx, and sy
-static __global__ void sfiltMagKernel(float* sfiltmag, float2* sx, float2* sy, 
-	                                  const int M, const int N){
-	int xidx = threadIdx.x + blockDim.x*blockIdx.x;
-	int yidx = threadIdx.y + blockDim.y*blockIdx.y;
-	if (xidx<N && yidx<M) {
-		int idx = yidx*N + xidx;
-		float sxmag = complexMagnitude(sx[idx]);
-		float symag = complexMagnitude(sy[idx]);
-		sfiltmag[idx] = sqrtf( sxmag * sxmag + symag * symag );
+// Returns the total magnitude of a gradient filter, computed as the L2 norm
+// of the x- and y-direction gradients. The x- and y-direction gradients are
+// assumed to have been computed on a complex-valued field, and the magnitudes
+// of their complex responses are calculated first before finding the net
+// response.
+//
+// The gradient magnitude is computed as:
+//  x_mag = sqrt(real(x)^2 + imag(x)^2)
+//  y_mag = sqrt(real(y)^2 + imag(y)^2)
+//  grad_mag = sqrt(x_mag^2 + y_mag^2)
+//
+// gradient_magnitude: resulting magnitude of the image gradient
+// gradient_in_x: the x-direction response of a gradient filter applied to the
+//             complex-valued image
+// gradient_in_y: the y-direction response of a gradient filter applied to the
+//             complex-valued image
+// M, N: number of rows and columns in each of the data arrays
+//
+static __global__ void GradientMagnitudeKernel(float* gradient_magnitude,
+                                              float2* gradient_in_x,
+                                              float2* gradient_in_y, 
+	                                          const int M,
+	                                          const int N) {
+	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
+	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
+	if (xidx < N && yidx < M) {
+		int idx = yidx * N + xidx;
+		float x_magnitue = complexMagnitude(gradient_in_x[idx]);
+		float y_magnitude = complexMagnitude(gradient_in_y[idx]);
+		gradient_magnitude[idx] = sqrtf(x_magnitude * xmagnitude +
+		                                y_magnitude * y_magnitude);
 	}
 }	
 
@@ -348,99 +389,126 @@ static __global__ void sfiltMagKernel(float* sfiltmag, float2* sx, float2* sy,
 // SIM is the product of the gradient ("S") and image magnitude ("IM"). The
 // metric considers sharp edgegs which are dark to be favorable. Since "dark" 
 // has a smaller numerical value, the image brightness, or local magnitude, is
-// subtracted from the expected maximum intensity so that (intmax - localmag)
+// subtracted from the expected maximum intensity so that 
+//
+//   (maximum_intensity - image_magnitude)
+//
 // gives a large value for favorable dark pixels. The SIM is then
 //
-//   SIM = sfiltmag * (intmax - localmag).
+//   SIM = gradient_magnitude * (maximum_intensity - image_magnitude).
 //
 // sim: output array of the SIM focus metric
-// sfiltmag: magnitude of the steerable filter (a gradient filter), applied
-//           to the reconstructed image
-// localmag: magnitude of a single slice's reconstructed image
-// intmax: maximum intensity expected over all slices; should be a constant
-//           across slices
-// M: number of rows in sim, sfiltmag, and localmag
-// N: number of cols in sim, sfiltmag, and localmag
-static __global__ void computeSIMkernel(float* sim, float* sfiltmag,
-                                        float* localmag, const float intmax, 
+// gradient_magnitude: magnitude of the a gradient filter which has been applied
+//           to the complex-valued reconstructed image
+// image_magnitude: magnitude of a single slice's reconstructed image
+// maximum_intensity: maximum intensity expected over all slices; should be a
+//           constant across slices
+// M: number of rows in sim, gradient_magnitude, and image_magnitude
+// N: number of cols in sim, gradient_magnitude, and image_magnitude
+static __global__ void computeSIMkernel(float* sim, 
+	                                    float* gradient_magnitude,
+                                        float* image_magnitude,
+                                        const float maximum_intensity, 
 										const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M) {
 		int idx = yidx * N + xidx;
-		sim[idx] = sfiltmag[idx] * (intmax - localmag[idx]);
+		sim[idx] = gradient_magnitude[idx] *
+		          (maximum_intensity - image_magnitude[idx]);
 	}
 }
 
 
-
-static __global__ void addShortKernel(short* dst, const short value,
+// In-place addition of shorts. The kernel is used to add value to all elements
+// of dest. The dest array has M rows and N columns.
+static __global__ void AddShortsKernel(short* dest, const short value,
                                       const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
-	if (xidx<N && yidx<M){
-		dst[yidx * N + xidx] += value;
+	if (xidx < N && yidx < M){
+		dest[yidx * N + xidx] += value;
 	}
 }
 
 
 
-
+// TODO(nloomis): docs
 //NB: the source and destination are the same location!
 //TODO: this might be a good use for atomic operators.
-static __global__ void powerKernel(float2* fsrc, const int xpix, const int ypix,
-								   const float pow, const float offset, const float sigma){
+static __global__ void PowerKernel(float2* fsrc,
+                                   const int N, const int M,
+								   const float power_order,
+								   const float power_filter_offset,
+								   const float sigma) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x; //pixel index that this thread deals with
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
-	if (xidx < xpix && yidx < ypix){
+	if (xidx < N && yidx < M){
+		int idx = yidx * N + xidx;
 
 		//get the FFTW-shifted u,v coordinates (in numbers of samples)
 		//option 4) use normalized freqs (just the magnitude) - note that uidx->u here in the nomenclature.
-		int halfx = xpix / 2;
-		int halfy = ypix / 2;
-		float u = (xidx >= halfx ? (float) (xpix - xidx) / (float) halfx :
-		                           (float) xidx / (float)halfx);
-		float v = (yidx >= halfy ? (float) (ypix - yidx) / (float)halfy :
-		                           (float)yidx / (float)halfy);
+		int halfx = N / 2;
+		int halfy = M / 2;
+		float u = (xidx >= halfx ? (float) (N - xidx) / (float) halfx :
+		                           (float) xidx / (float) halfx);
+		float v = (yidx >= halfy ? (float) (M - yidx) / (float) halfy :
+		                           (float)yidx / (float) halfy);
 
-		int idx = yidx * ypix + xidx; //the linear index of the data
 		float2 value = fsrc[idx]; //the value to work with
 
 		//do some operation on value using u,v
 		//here, i'm using a power filter to keep the lower freqs but kill the high freqs.
-		float fkeep = __expf( - ( __powf(u,pow) + __powf(v,pow) ) / sigma);
+		float fkeep = __expf(-( __powf(u, power_order) +
+		                        __powf(v, power_order)) /
+		                      sigma);
 		value.x = value.x * fkeep;
 		value.y = value.y * fkeep; 
-		//the offset is the fraction to keep no matter what; only (1-offset) of the value
+		//the power_filter_offset is the fraction to keep no matter what; only (1-power_filter_offset) of the value
 		//is allowed to be changed.
+
+		// TODO(nloomis): where is power_filter_offset used?!?
 
 		//store the result back to the destination
 		fsrc[idx] = value;
 	}
 }
 
-static __global__ void fillSfiltxKernel(float2* sfiltx, const float sigma, 
-                                        const int xpix, const int ypix) {
+// Computes the convolution kernel for a steerable filter in the x-direction. A
+// steerable filter has two important characteristics:
+//  1) the filter includes some smoothing, so the effects of random noise are
+//     reduced, and
+//  2) the gradient magnitude is independent of the orientation of an edge in
+//     an image.
+// 
+// TODO(nloomis): finish docs.
+// note: use float2 so that fft2 can be taken immediately
+static __global__ void fillSfiltxKernel(float2* gradient_filter_in_x, const float sigma, 
+                                        const int N, const int M) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
-	if (xidx < xpix && yidx < ypix){
-		int halfx = xpix / 2;
-		int halfy = ypix / 2;
-		float u = (xidx >= halfx ? -(float)(xpix - xidx) : (float)xidx);
-		float v = (yidx >= halfy ? -(float)(ypix - yidx) : (float)yidx);
-
-		int idx = yidx * ypix + xidx; //the linear index of the data
+	if (xidx < N && yidx < M){
+        int idx = yidx * N + xidx;
+        
+		int halfx = N / 2;
+		int halfy = M / 2;
+		float u = (xidx >= halfx ? -(float)(N - xidx) : (float) xidx);
+		float v = (yidx >= halfy ? -(float)(M - yidx) : (float) yidx);
 		
 		//set the value
-		sfiltx[idx].y = 0;
-		sfiltx[idx].x = -2.0f * u * __expf(-(u * u + v * v) /
-		                (2.0f * sigma * sigma));
+		gradient_filter_in_x[idx].x = -2.0f * u * __expf(-(u * u + v * v) /
+		                             (2.0f * sigma * sigma));
+        // The imaginary component is zero.
+        gradient_filter_in_x[idx].y = 0;
+
 	}
 }
 
 
-
-static __global__ void fillSfiltyKernel(float2* sfiltx, const float sigma, 
+// Computes the convolution kernel for a steerable filter in the y-direction.
+// See documentation for fillSfiltxKernel above.
+//
+static __global__ void fillSfiltyKernel(float2* gradient_filter_in_y, const float sigma, 
                                         const int xpix, const int ypix) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
@@ -453,50 +521,54 @@ static __global__ void fillSfiltyKernel(float2* sfiltx, const float sigma,
 		int idx = yidx * ypix + xidx; //the linear index of the data
 		
 		//set the value
-		sfiltx[idx].y = 0;
-		sfiltx[idx].x = -2.0f * v * __expf(-(u * u + v * v) /
+		gradient_filter_in_y[idx].x = -2.0f * v * __expf(-(u * u + v * v) /
 			            (2.0f * sigma * sigma));
+        // The imaginary component is zero.
+        gradient_filter_in_y[idx].y = 0;
 	}
 }
 
 
 
-void reconstruct(float* SIM, short* Sidx, float* Rint, short* Ridx, float* holosrc, 
+void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* min_intensity_cpu, short* index_of_min_intensity, float* hologram_cpu, 
 					 double *z, const int nz, const int M, const int N, 
-					 const double lambda, const double pixelsize,
-					 const float powOrder, const float powOffset,
-					 const float sfiltsigma, const float intmax,
-					 float* ratsim, bool rintmode, bool ratsimmode) {
-	float* holodev, *rintdev, *simmaxdev, *sfiltmag, *localmag, *sim, *ratsimdev;
-	short* ridxdev, *sidxdev;
-	float2* cholodev, *recdev, *sfiltx, *sfilty, *sx, *sy;
+					 const double wavelength, const double pixel_size,
+					 const float power_filter_order, const float power_filter_offset,
+					 const float steerable_filter_sigma, const float maximum_intensity,
+					 float* intensity_at_best_focus_cpu, bool rintmode, bool record_intensity_at_best_focus) {
+	float* hologram_gpu, *min_intensity_gpu, *simmaxdev, *gradient_magnitude_gpu, *image_magnitude, *sim, *intensity_at_best_focus_gpu;
+	short* index_of_min_intensity_gpu, *index_of_max_focus_metric_gpu;
+	float2* chologram_gpu, *reconstruction_gpu, *gradient_filter_in_x, *gradient_filter_in_y, *sx, *sy;
 	float adudu, cutoff2, fftscale;
 	float2 offsetPhaseExp;
 	float sigma;
 
+    // A block is the number of threads which are launched at each round. A size
+    // of 16x16 is used to step through the image 256 threads at a time.
 	dim3 myblock(16, 16);
+    // TODO(nloomis): doc
 	dim3 mygrid( roundUpDiv(N,16), roundUpDiv(M,16) );
 
 	mexPrintf("Uploading hologram\n");
 
 	//upload the hologram and convert it to a complex-valued matrix
-	cudaMalloc( (void**)&holodev, sizeof(float)*M*N);
-	cudaMalloc( (void**)&cholodev, sizeof(float2)*M*N);
-	cudaMemcpy( holodev, holosrc, sizeof(float)*M*N, cudaMemcpyHostToDevice);
-	float_to_complexKernel<<<mygrid, myblock>>>(cholodev, holodev, M, N);
-	cudaFree(holodev);
+	cudaMalloc( (void**)&hologram_gpu, sizeof(float)*M*N);
+	cudaMalloc( (void**)&chologram_gpu, sizeof(float2)*M*N);
+	cudaMemcpy( hologram_gpu, hologram_cpu, sizeof(float)*M*N, cudaMemcpyHostToDevice);
+	float_to_complexKernel<<<mygrid, myblock>>>(chologram_gpu, hologram_gpu, M, N);
+	cudaFree(hologram_gpu);
 
 	mexPrintf("Creating memory on GPU\n");
 
-	//create variables to track the max SIM, min int
+	//create variables to track the max focus_metric, min int
 	cudaMalloc( (void**)&simmaxdev, sizeof(float)*M*N);
-	cudaMalloc( (void**)&sidxdev, sizeof(short)*M*N);
-	cudaMemset(sidxdev, 0, sizeof(short)*M*N);
-	//fillFloatKernel<<<mygrid, myblock>>>(rintdev, FLT_MIN, M, N); //don't need this
+	cudaMalloc( (void**)&index_of_max_focus_metric_gpu, sizeof(short)*M*N);
+	cudaMemset(index_of_max_focus_metric_gpu, 0, sizeof(short)*M*N);
+	//fillFloatKernel<<<mygrid, myblock>>>(min_intensity_gpu, FLT_MIN, M, N); //don't need this
 	if (rintmode){
-		cudaMalloc( (void**)&rintdev, sizeof(float)*M*N);
-		cudaMalloc( (void**)&ridxdev, sizeof(short)*M*N);
-		cudaMemset(ridxdev, 0, sizeof(short)*M*N);
+		cudaMalloc( (void**)&min_intensity_gpu, sizeof(float)*M*N);
+		cudaMalloc( (void**)&index_of_min_intensity_gpu, sizeof(short)*M*N);
+		cudaMemset(index_of_min_intensity_gpu, 0, sizeof(short)*M*N);
 	}
 
 	mexPrintf("Creating FFT plan\n");
@@ -509,45 +581,45 @@ void reconstruct(float* SIM, short* Sidx, float* Rint, short* Ridx, float* holos
 	
 	//compute the (power-modulated) spectra, which will be used for each reconstruction step
 	//take the FFT of the hologram data
-	cufftExecC2C(plan, cholodev, cholodev, CUFFT_FORWARD);
+	cufftExecC2C(plan, chologram_gpu, chologram_gpu, CUFFT_FORWARD);
 
 	mexPrintf("Applying power filter\n");
 
 	//apply the power kernel filter
-	if (powOrder > 0) {
+	if (power_filter_order > 0) {
 		//mexPrintf("Applying power kernel\n");
-		sigma = -1.0f/log(powOffset);
-		powerKernel<<<mygrid, myblock>>>(cholodev, N, M,
-			powOrder, powOffset, sigma);
+		sigma = -1.0f/log(power_filter_offset);
+		PowerKernel<<<mygrid, myblock>>>(chologram_gpu, N, M,
+			power_filter_order, power_filter_offset, sigma);
 	}
 
 	mexPrintf("Computing steerable filter\n");
 
 	//compute the steerable filter, used for each reconstruction step
-	cudaMalloc((void**) &sfiltx, sizeof(float2)*M*N);
-	cudaMalloc((void**) &sfilty, sizeof(float2)*M*N);
-	fillSfiltxKernel<<<mygrid,myblock>>>(sfiltx,sfiltsigma,M,N);
-	fillSfiltyKernel<<<mygrid,myblock>>>(sfilty,sfiltsigma,M,N);
-	cufftExecC2C(plan, sfiltx, sfiltx, CUFFT_FORWARD); //compute the freq-domain version of the filter
-	cufftExecC2C(plan, sfilty, sfilty, CUFFT_FORWARD); 
+	cudaMalloc((void**) &gradient_filter_in_x, sizeof(float2) * M * N);
+	cudaMalloc((void**) &gradient_filter_in_y, sizeof(float2) * M * N);
+	fillSfiltxKernel<<<mygrid, myblock>>>(gradient_filter_in_x, steerable_filter_sigma, M, N);
+	fillSfiltyKernel<<<mygrid, myblock>>>(gradient_filter_in_y, steerable_filter_sigma, M, N);
+	cufftExecC2C(plan, gradient_filter_in_x, gradient_filter_in_x, CUFFT_FORWARD); //compute the freq-domain version of the filter
+	cufftExecC2C(plan, gradient_filter_in_y, gradient_filter_in_y, CUFFT_FORWARD);
 	//..and reserve memory for the resulting sx, sy gradients
-	cudaMalloc((void**) &sx, sizeof(float2)*M*N);
-	cudaMalloc((void**) &sy, sizeof(float2)*M*N);
-	cudaMalloc((void**) &sfiltmag, sizeof(float)*M*N);
+	cudaMalloc((void**) &sx, sizeof(float2) * M * N);
+	cudaMalloc((void**) &sy, sizeof(float2) * M * N);
+	cudaMalloc((void**) &gradient_magnitude_gpu, sizeof(float) * M * N);
 
 
 
 	//reserve memory for the reconstruction
-	cudaMalloc( (void**)&recdev, sizeof(float2)*M*N);
+	cudaMalloc( (void**)&reconstruction_gpu, sizeof(float2) * M * N);
 
 
 	//reserve memory for the focus metric components
-	cudaMalloc( (void**)&localmag, sizeof(float)*M*N);
-	cudaMalloc( (void**)&sim, sizeof(float)*M*N);
-	if (ratsimmode)
-		cudaMalloc( (void**)&ratsimdev, sizeof(float)*M*N);
+	cudaMalloc( (void**)&image_magnitude, sizeof(float) * M * N);
+	cudaMalloc( (void**)&sim, sizeof(float) * M * N);
+	if (record_intensity_at_best_focus)
+		cudaMalloc( (void**)&intensity_at_best_focus_gpu, sizeof(float) * M * N);
 
-	//fillFloatKernel<<<mygrid, myblock>>>(localmag, 1.0f, M, N); //don't need this
+	//fillFloatKernel<<<mygrid, myblock>>>(image_magnitude, 1.0f, M, N); //don't need this
 
 	mexPrintf("Computing reconstructions\n");
 
@@ -555,129 +627,153 @@ void reconstruct(float* SIM, short* Sidx, float* Rint, short* Ridx, float* holos
 	//minimum intensity
 	for (int i=0; i<nz; i++){
 		//copy the fft spectrum to a variable that's temporary for each plane
-		cudaMemcpy(recdev, cholodev, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice);
+		cudaMemcpy(reconstruction_gpu, chologram_gpu, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice);
 
 		//set the propagation parameters
-		setPropagationParams( (float)(z[i]), (float)lambda, (float)pixelsize, M, N, 
+		setPropagationParams( (float)(z[i]), (float)wavelength, (float)pixel_size, M, N, 
 			&adudu, &cutoff2, &offsetPhaseExp, &fftscale, false);
 
 		//apply the propagation kernel (full... could speed this up by ignoring cutoff)
-		fresnelKernel<<<mygrid, myblock>>>(recdev, M, N, adudu, 
+		fresnelKernel<<<mygrid, myblock>>>(reconstruction_gpu, M, N, adudu, 
 			cutoff2, offsetPhaseExp, fftscale);
 
 		//take the inverse transform: get an image at the plane.
-		cufftExecC2C(plan, recdev, recdev, CUFFT_INVERSE);
+		cufftExecC2C(plan, reconstruction_gpu, reconstruction_gpu, CUFFT_INVERSE);
 
 		//compute the magnitude
-		computeMagKernel<<<mygrid, myblock>>>(recdev, M, N);
+		computeMagKernel<<<mygrid, myblock>>>(reconstruction_gpu, M, N);
 
 		//compute the steerable gradient responses in the x and y directions
-		cudaMemcpy( sx, recdev, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice); //copy the magnitude info
+		cudaMemcpy( sx, reconstruction_gpu, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the magnitude info
 		cufftExecC2C(plan, sx, sx, CUFFT_FORWARD); //the spectrum of the magnitude
-		cudaMemcpy( sy, sx, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice); //copy the spectrum information
+		cudaMemcpy( sy, sx, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the spectrum information
 		//apply the sfilt kernels in the x and y directions
-		complexMultKernel<<<mygrid, myblock>>>(sx, sx, sfiltx, M, N);
-		complexMultKernel<<<mygrid, myblock>>>(sy, sy, sfilty, M, N);
+		ComplexMultiplicationKernel<<<mygrid, myblock>>>(sx, sx, gradient_filter_in_x, M, N);
+		ComplexMultiplicationKernel<<<mygrid, myblock>>>(sy, sy, gradient_filter_in_y, M, N);
 		cufftExecC2C(plan, sx, sx, CUFFT_INVERSE);
 		cufftExecC2C(plan, sy, sy, CUFFT_INVERSE);
 		//finally: compute the magnitude and orientation
-		sfiltMagKernel<<<mygrid,myblock>>>(sfiltmag, sx, sy, M, N);
-		scaleFloatKernel<<<mygrid,myblock>>>(sfiltmag, 1.0f/((float)(M*M) * (float)(N*N)), M, N);
-		//TODO: add orientation later, if desired
+		GradientMagnitudeKernel<<<mygrid,myblock>>>(gradient_magnitude_gpu, sx, sy, M, N);
+		scaleFloatKernel<<<mygrid,myblock>>>(gradient_magnitude_gpu, 1.0f / ((float) (M * M) * (float) (N * N)), M, N);
 
-
-		//find the local min intensity (for SIM)
-		//localMinKernel<<<mygrid, myblock>>>(localmag, recdev, M, N);
-		copyRealKernel<<<mygrid, myblock>>>(localmag, recdev, M, N);
+		//find the local min intensity (for focus_metric)
+		//localMinKernel<<<mygrid, myblock>>>(image_magnitude, reconstruction_gpu, M, N);
+		copyRealKernel<<<mygrid, myblock>>>(image_magnitude, reconstruction_gpu, M, N);
 
 
 		//compute the SIM metric
-		computeSIMkernel<<<mygrid, myblock>>>(sim, sfiltmag, localmag, intmax, M, N);
+		computeSIMkernel<<<mygrid, myblock>>>(sim, gradient_magnitude_gpu, image_magnitude, maximum_intensity, M, N);
 		
 
 		if (rintmode){
 			//compare the current intensity to the previous minimum
-			if (i==0) 
-				copyRealKernel<<<mygrid,myblock>>>(rintdev, recdev, M, N);
+			if (i == 0) 
+				copyRealKernel<<<mygrid,myblock>>>(min_intensity_gpu, reconstruction_gpu, M, N);
 			else 
-				compareReal2Kernel<<<mygrid, myblock>>>(rintdev, ridxdev, recdev, i, M, N);
+				compareReal2Kernel<<<mygrid, myblock>>>(min_intensity_gpu, index_of_min_intensity_gpu, reconstruction_gpu, i, M, N);
 		}
 
 		//compare the current SIM to the previous SIMs
-		if (i==0) {
+		if (i == 0) {
 			cudaMemcpy(simmaxdev, sim, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
-			if (ratsimmode)
-				cudaMemcpy(ratsimdev, rintdev, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
+			if (record_intensity_at_best_focus)
+				cudaMemcpy(intensity_at_best_focus_gpu, min_intensity_gpu, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
 		}
 		else {
-			if (!ratsimmode)
-				compareRealKernel<<<mygrid, myblock>>>(simmaxdev, sidxdev, sim, i, M, N);
-			else //ratsimmode==true
-				compareRealKernel<<<mygrid, myblock>>>(simmaxdev, sidxdev, sim, ratsimdev, recdev, i, M, N);
+			if (!record_intensity_at_best_focus)
+				compareRealKernel<<<mygrid, myblock>>>(
+                    simmaxdev, 
+                    index_of_max_focus_metric_gpu,
+                    sim,
+                    i, 
+                    M, N);
+			else //record_intensity_at_best_focus == true
+				compareRealKernel<<<mygrid, myblock>>>(
+                    simmaxdev,
+                    index_of_max_focus_metric_gpu, 
+                    sim, 
+                    intensity_at_best_focus_gpu, 
+                    reconstruction_gpu, 
+                    i, 
+                    M, N);
 		}
 
 
 	}
 
-	//convert from c-style indexing to matlab-style indexing
+	// C-style indexing uses 0 as its first element, while Matlab uses 1 for its
+    // first element. Add a 1 to all the slice indices recorded so that the
+    // returned indices are directly usable in Matlab.
 	if (rintmode)
-		addShortKernel<<<mygrid, myblock>>>(ridxdev, 1, M, N);
-	addShortKernel<<<mygrid, myblock>>>(sidxdev, 1, M, N);
+		AddShortsKernel<<<mygrid, myblock>>>(index_of_min_intensity_gpu, 1, M, N);
+	AddShortsKernel<<<mygrid, myblock>>>(
+        index_of_max_focus_metric_gpu, 1, M, N);
 
+    // Copy results from the GPU back to the CPU memory.
 	mexPrintf("Copying results back to host\n");
-
-	//return the data to the host
-	cudaMemcpy(SIM, simmaxdev, sizeof(float)*M*N, cudaMemcpyDeviceToHost);
-	cudaMemcpy(Sidx, sidxdev, sizeof(short)*M*N, cudaMemcpyDeviceToHost);
-	if (rintmode){
-		cudaMemcpy(Rint, rintdev, sizeof(float)*M*N, cudaMemcpyDeviceToHost);
-		cudaMemcpy(Ridx, ridxdev, sizeof(short)*M*N, cudaMemcpyDeviceToHost);
+	cudaMemcpy(focus_metric, simmaxdev, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+	cudaMemcpy(index_of_max_focus_metric, index_of_max_focus_metric_gpu, sizeof(short) * M * N, cudaMemcpyDeviceToHost);
+	if (rintmode) {
+		cudaMemcpy(min_intensity_cpu, min_intensity_gpu, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+		cudaMemcpy(index_of_min_intensity, index_of_min_intensity_gpu, sizeof(short) * M * N, cudaMemcpyDeviceToHost);
 	}
-	if (ratsimmode)
-		cudaMemcpy(ratsim, ratsimdev, sizeof(float)*M*N, cudaMemcpyDeviceToHost);
+	if (record_intensity_at_best_focus)
+		cudaMemcpy(intensity_at_best_focus_cpu, intensity_at_best_focus_gpu, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
 
 	mexPrintf("Cleaning up memory and plans\n");
 
 	//clean up!
 	cufftDestroy(plan);
-	cudaFree(cholodev);
-	cudaFree(recdev);
+	cudaFree(chologram_gpu);
+	cudaFree(reconstruction_gpu);
 	if (rintmode){
-		cudaFree(rintdev);
-		cudaFree(ridxdev);
+		cudaFree(min_intensity_gpu);
+		cudaFree(index_of_min_intensity_gpu);
 	}
-	cudaFree(sfiltx);
-	cudaFree(sfilty);
+	cudaFree(gradient_filter_in_x);
+	cudaFree(gradient_filter_in_y);
 	cudaFree(sx);
 	cudaFree(sy);
-	cudaFree(sfiltmag);
+	cudaFree(gradient_magnitude_gpu);
 	cudaFree(sim);
-	cudaFree(localmag);
-	cudaFree(sidxdev);
+	cudaFree(image_magnitude);
+	cudaFree(index_of_max_focus_metric_gpu);
 	cudaFree(simmaxdev);
-	if (ratsimmode)
-		cudaFree(ratsimdev);
+	if (record_intensity_at_best_focus)
+		cudaFree(intensity_at_best_focus_gpu);
 }
 
 
 
-// [SIM, Sidx, Rint, Ridx, R_at_SIM] = maxSIMfm(img, z, lambda, pixelsize, ...
-//           powerKernOrder, powerKernOffset, sigma, intmax);
-void mexFunction( int nlhs, mxArray *plhs[],
-                  int nrhs, const mxArray *prhs[])
-{
-	
-	float* holosrc, *Rint, *SIM, *ratsim = NULL;
-	double *dsrc;
-	unsigned char *isrc;
-	short* Ridx, *Sidx;
-	double *z, lambda = 658e-9, pixelsize = 9e-6;
+// [focus_metric, index_of_max_focus_metric, min_intensity_cpu, index_of_min_intensity, R_at_SIM] = maxSIMfm(img, z, wavelength, pixel_size, ...
+//           powerKernOrder, powerKernOffset, sigma, maximum_intensity);
+void mexFunction( int nlhs, mxArray* plhs[],
+                  int nrhs, const mxArray* prhs[]) {
+
+    // Pointer for the hologram data.
+	float* hologram_cpu;
+    // Minimum reconstruction intensity.
+    float* min_intensity_cpu;
+    // Stores a metric for how well each hologram pixel can be focused.
+    float* focus_metric;
+    float* intensity_at_best_focus_cpu = NULL;
+    // Pointer for source hologram data, if it is passed in as a double.
+	double* dsrc;
+    // Pointer for source hologram data, if it is passed in as an unsigned char.
+	unsigned char* isrc;
+	short* index_of_min_intensity;
+    short* index_of_max_focus_metric;
+	double* z;
+    // Wavelength of the illumination light in meters.
+    double wavelength = 658e-9;
+    // Size of a camera pixel in meters.
+    double pixel_size = 9e-6;
 	int M, N, nz;
-	float powOrder = -1, powOffset = .001, sigma = 2, intmax = 1000;
-	bool rintmode, ratsimmode;
+	float power_filter_order = -1, power_filter_offset = .001, sigma = 2, maximum_intensity = 1000;
+	bool rintmode, record_intensity_at_best_focus;
 
 	if (nrhs<2)
-		mexErrMsgTxt("maxSIMfm(image, z, [lambda], [pixelsize]) requires at least two arguments.");
+		mexErrMsgTxt("maxSIMfm(image, z, [wavelength], [pixel_size]) requires at least two arguments.");
 
 	//get the size of the hologram
 	M = mxGetN(prhs[0]); //number of y-direction pixels
@@ -687,52 +783,54 @@ void mexFunction( int nlhs, mxArray *plhs[],
 	//this is because Matlab stores its data reading down the rows (row-major), while
 	//C is column-wise ordering (column-major)
 	
-	//mexPrintf("nrhs = %i\n", nrhs);
-
 	//retrieve the depths at which to do reconstructions
 	z = mxGetPr(prhs[1]);
-	nz = mxGetM(prhs[1])*mxGetN(prhs[1]);
+	nz = mxGetM(prhs[1]) * mxGetN(prhs[1]);
 	
 	//mexPrintf("M: %i, N: %i, nz: %i\n", M, N, nz);
 
-	//get optional parameters; use defauls otherwise
+	//get optional parameters; use defaults otherwise
 	if (nrhs>=3)
 		if (!mxIsEmpty(prhs[2]))
-			lambda = mxGetScalar(prhs[2]);
+			wavelength = mxGetScalar(prhs[2]);
 	if (nrhs>=4)
 		if (!mxIsEmpty(prhs[3]))
-			pixelsize = mxGetScalar(prhs[3]);
+			pixel_size = mxGetScalar(prhs[3]);
 	if (nrhs>=5)
 		if (!mxIsEmpty(prhs[4]))
-			powOrder = (float) mxGetScalar(prhs[4]);
+			power_filter_order = (float) mxGetScalar(prhs[4]);
 	if (nrhs>=6)
 		if (!mxIsEmpty(prhs[5]))
-			powOffset = (float) mxGetScalar(prhs[5]);
+			power_filter_offset = (float) mxGetScalar(prhs[5]);
 	if (nrhs>=7)
 		if (!mxIsEmpty(prhs[6]))
 			sigma = (float) mxGetScalar(prhs[6]);
 	if (nrhs>=8)
 		if (!mxIsEmpty(prhs[7]))
-			intmax = (float) mxGetScalar(prhs[7]);
+			maximum_intensity = (float) mxGetScalar(prhs[7]);
 			
-
-	//get the holographic image! 
-	// note: if it's double or int, need to convert to float.
-
+    // Retrieve the pointer to the hologram data. If the data type is not float,
+    // it needs to be converted for to float for efficient computations on the
+    // GPU.
 	mxClassID imgclass = mxGetClassID(prhs[0]);
-	switch (imgclass){
+	switch (imgclass) {
 		case mxSINGLE_CLASS:
-			holosrc = (float*) mxGetPr(prhs[0]);
+		    // If the hologram was passed in as a float, copy its pointer.
+			hologram_cpu = (float*) mxGetPr(prhs[0]);
 			break;
 		case mxDOUBLE_CLASS:
+		    // If the hologram was passed in as a double, it needs to be
+		    // down-cast to float.
 			dsrc = mxGetPr(prhs[0]);
-			holosrc = (float*) mxMalloc( sizeof(float)*M*N );
-			double_to_float(holosrc, dsrc, M*N);
+			hologram_cpu = (float*) mxMalloc(sizeof(float) * M * N);
+			double_to_float(hologram_cpu, dsrc, M * N);
 			break;
 		case mxUINT8_CLASS:
+		    // If the hologram was passsed in as an unsigned char (what Matlab
+		    // calls "uint8"), it needs to be converted to float.
 			isrc = (unsigned char*) mxGetPr(prhs[0]);
-			holosrc = (float*) mxMalloc( sizeof(float)*M*N );
-			uint8_to_float(holosrc, isrc, M*N);
+			hologram_cpu = (float*) mxMalloc(sizeof(float) * M * N);
+			uint8_to_float(hologram_cpu, isrc, M * N);
 			break;
 		default:
 			mexErrMsgTxt("Input image needs to be single, double, or uint8.");
@@ -741,39 +839,38 @@ void mexFunction( int nlhs, mxArray *plhs[],
 	
 	//create outputs
 	
-	if (nlhs>2)
+	if (nlhs > 2)
 		rintmode = true;
 	else
 		rintmode = false;
-	if (nlhs>4)
-		ratsimmode = true;
+	if (nlhs > 4)
+		record_intensity_at_best_focus = true;
 	else
-		ratsimmode = false;
+		record_intensity_at_best_focus = false;
 
 	plhs[0] = mxCreateNumericMatrix(N, M, mxSINGLE_CLASS, mxREAL); //the order is reversed here
 	plhs[1] = mxCreateNumericMatrix(N, M, mxINT16_CLASS, mxREAL); //from what you'd expect... row-major vs column-major.
-	SIM = (float*)mxGetPr(plhs[0]);
-	Sidx = (short*)mxGetPr(plhs[1]);
+	focus_metric = (float*) mxGetPr(plhs[0]);
+	index_of_max_focus_metric = (short*) mxGetPr(plhs[1]);
 
-	if (rintmode){
+	if (rintmode) {
 		plhs[2] = mxCreateNumericMatrix(N, M, mxSINGLE_CLASS, mxREAL);
 		plhs[3] = mxCreateNumericMatrix(N, M, mxINT16_CLASS, mxREAL);
-		Rint = (float*)mxGetPr(plhs[2]); //single
-		Ridx = (short*)mxGetPr(plhs[3]); //int16
+		min_intensity_cpu = (float*) mxGetPr(plhs[2]); //single
+		index_of_min_intensity = (short*) mxGetPr(plhs[3]); //int16
 	}
 
-	if (ratsimmode){
+	if (record_intensity_at_best_focus){
 		plhs[4] = mxCreateNumericMatrix(N, M, mxSINGLE_CLASS, mxREAL);
-		ratsim  = (float*)mxGetPr(plhs[4]);
+		intensity_at_best_focus_cpu  = (float*) mxGetPr(plhs[4]);
 	}
-
-	//mexPrintf("Derivative: %i\n", derivOrder);
 
 	//reconstruct hologram and find mins
-	reconstruct(SIM, Sidx, Rint, Ridx, holosrc, z, nz, M, N, lambda, pixelsize, 
-		powOrder, powOffset, sigma, intmax, ratsim, rintmode, ratsimmode);
+	reconstruct(SIM, index_of_max_focus_metric, min_intensity_cpu, index_of_min_intensity, hologram_cpu, z, nz, M, N, wavelength, pixel_size, 
+		power_filter_order, power_filter_offset, sigma, maximum_intensity, intensity_at_best_focus_cpu, rintmode, record_intensity_at_best_focus);
 
-	//clean up
+	// If the hologram was originally passed in as a double or unsigned chars,
+	// hologram_cpu would have been malloc'd. Free it now, before exiting.
 	if ( imgclass == mxDOUBLE_CLASS || imgclass == mxUINT8_CLASS )
-		mxFree(holosrc);
+		mxFree(hologram_cpu);
 }
