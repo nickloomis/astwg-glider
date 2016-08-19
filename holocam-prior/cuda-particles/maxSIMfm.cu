@@ -155,7 +155,7 @@ __device__ float complexMagnitude(float2 a) {
 // Converts a float to a complex float, storing the result into dest. The real
 // part of dest is copied from source, while the imaginary part is set to zero. The
 // size of the source array is M rows and N columns.
-static __global__ void float_to_complexKernel(float2* dest, float* source,
+static __global__ void FloatToComplexKernel(float2* dest, float* source,
                                               const int M, const int N) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
@@ -432,44 +432,93 @@ static __global__ void AddShortsKernel(short* dest, const short value,
 }
 
 
+/******************************************************************************
+FFT coordinates
 
-// TODO(nloomis): docs
-//NB: the source and destination are the same location!
-//TODO: this might be a good use for atomic operators.
+CUDA's FFT follows the same pattern as the popular FFTW library and arranges its
+output data in a computationally-efficient but confusing pattern. The first half
+of the data corresponds to the positive frequency components, while the last
+half of the data corresponds to the negative frequency components. CUDA also
+makes use of the fact that the component at the positive Nyquist frequency is
+the same as at the negative Nyquist frequency.
+
+The output is arranged as:
+
+  [0, 1, 2, 3, ..., N/2 - 1, N/2, -N/2+1, -N/2+2, ... -1]
+
+  |<------------------------>fn<----------------------->|
+       positive frequency          negative frequency
+           components                 components
+
+where the N/2 sample is the Nyquist frequency component and is the same for both
+the positive and negative Nyquist frequency.
+
+Functions which compute values directly in the Fourier domain first find the
+frequency component for each array entry.
+******************************************************************************/
+
+
+// Applies a specialized low-pass filter to data which has been 2D Fourier
+// transformed.
+//
+// A "power" filter is a low-pass filter with a controllable ramp down, and
+// follows
+//
+//   P(u, v) = exp(-(u^p + v^p) / sigma)
+//
+// where p is a positive even integer, sigma is a scale parameter, and u and
+// v are normalized frequences. Normalization is against the Nyquist frequency,
+// so that u and v range from [-1, 1]. Setting p = 2 gives a Gaussian low-pass
+// filter; the higher p, the higher the cut-off frequency becomes and the
+// sharper the ramp down.
+//
+// The sigma parameter can be used to set the scale, and functions like an
+// additive offset for high frequencies (so that a small, controllable amount of
+// the higher spatial frequencies can be kept). At |u| = |v| = 1, the filter has
+// a value of P = exp(-1 / sigma).
+//
+// The power filter is applied directly to the 2D FFT data in fsrc, multiplying
+// the magnitude of the component. The power_order is p, and should be an even
+// integer. M is the number of rows and N is the number of columns in fsrc.
+// The data is modified in-place.
 static __global__ void PowerKernel(float2* fsrc,
                                    const int N, const int M,
 								   const float power_order,
-								   const float power_filter_offset,
 								   const float sigma) {
-	int xidx = threadIdx.x + blockDim.x * blockIdx.x; //pixel index that this thread deals with
+	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
 	if (xidx < N && yidx < M){
 		int idx = yidx * N + xidx;
 
 		//get the FFTW-shifted u,v coordinates (in numbers of samples)
 		//option 4) use normalized freqs (just the magnitude) - note that uidx->u here in the nomenclature.
-		int halfx = N / 2;
-		int halfy = M / 2;
-		float u = (xidx >= halfx ? (float) (N - xidx) / (float) halfx :
-		                           (float) xidx / (float) halfx);
-		float v = (yidx >= halfy ? (float) (M - yidx) / (float) halfy :
-		                           (float)yidx / (float) halfy);
+        // Find the sample corresponding to the Nyquist frequency.
+		int nyquist_sample_x = N / 2;
+		int nyquist_sample_y = M / 2;
 
-		float2 value = fsrc[idx]; //the value to work with
+        // Compute the normalized frequency for each pixel.
+        // Each pixel's corresponding Fourier frequency is found using the
+        // shifted coordinates discussed above, then normalized so that the
+        // Nyquist frequency is 1.
+		float normalized_freq_u = (xidx >= nyquist_sample_x ?
+            (float) (N - xidx) / (float) nyquist_sample_x :
+		    (float) xidx / (float) nyquist_sample_x);
+		float normalized_freq_v = (yidx >= nyquist_sample_y ?
+            (float) (M - yidx) / (float) nyquist_sample_y :
+		    (float)yidx / (float) nyquist_sample_y);
 
-		//do some operation on value using u,v
-		//here, i'm using a power filter to keep the lower freqs but kill the high freqs.
-		float fkeep = __expf(-( __powf(u, power_order) +
-		                        __powf(v, power_order)) /
-		                      sigma);
+        // Pull out the coefficient for this pixel's frequency.
+		float2 value = fsrc[idx];
+
+        // Compute the power kernel's magnitude.
+		float fkeep = __expf(-( __powf(normalized_freq_u, power_order) +
+		                        __powf(nonrmalized_freq_v, power_order)) /
+		                     sigma);
+
+        // Scale the FFT coefficient's magnitude and store it back to its
+        // original array.
 		value.x = value.x * fkeep;
 		value.y = value.y * fkeep; 
-		//the power_filter_offset is the fraction to keep no matter what; only (1-power_filter_offset) of the value
-		//is allowed to be changed.
-
-		// TODO(nloomis): where is power_filter_offset used?!?
-
-		//store the result back to the destination
 		fsrc[idx] = value;
 	}
 }
@@ -482,8 +531,10 @@ static __global__ void PowerKernel(float2* fsrc,
 //     an image.
 // 
 // TODO(nloomis): finish docs.
-// note: use float2 so that fft2 can be taken immediately
-static __global__ void fillSfiltxKernel(float2* gradient_filter_in_x, const float sigma, 
+// note: use float2 so that fft2 can be taken immediately... or is it in freq
+// domain already??
+static __global__ void ComputeSteerableFilterXCoefsKernel(float2* gradient_filter_in_x,
+                                        const float sigma, 
                                         const int N, const int M) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
@@ -506,9 +557,9 @@ static __global__ void fillSfiltxKernel(float2* gradient_filter_in_x, const floa
 
 
 // Computes the convolution kernel for a steerable filter in the y-direction.
-// See documentation for fillSfiltxKernel above.
+// See documentation for ComputeSteerableFilterXCoefsKernel above.
 //
-static __global__ void fillSfiltyKernel(float2* gradient_filter_in_y, const float sigma, 
+static __global__ void ComputeSteerableFilterYCoefsKernel(float2* gradient_filter_in_y, const float sigma, 
                                         const int xpix, const int ypix) {
 	int xidx = threadIdx.x + blockDim.x * blockIdx.x;
 	int yidx = threadIdx.y + blockDim.y * blockIdx.y;
@@ -528,88 +579,165 @@ static __global__ void fillSfiltyKernel(float2* gradient_filter_in_y, const floa
 	}
 }
 
+// Hint: it would have been much better to create structs to hold the parameters
+// and options, reducing the number of variables passed in.
+// Hint: the mode flags would have been better as enums than as bools.
 
-
-void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* min_intensity_cpu, short* index_of_min_intensity, float* hologram_cpu, 
-					 double *z, const int nz, const int M, const int N, 
-					 const double wavelength, const double pixel_size,
-					 const float power_filter_order, const float power_filter_offset,
-					 const float steerable_filter_sigma, const float maximum_intensity,
-					 float* intensity_at_best_focus_cpu, bool rintmode, bool record_intensity_at_best_focus) {
-	float* hologram_gpu, *min_intensity_gpu, *simmaxdev, *gradient_magnitude_gpu, *image_magnitude, *sim, *intensity_at_best_focus_gpu;
-	short* index_of_min_intensity_gpu, *index_of_max_focus_metric_gpu;
-	float2* chologram_gpu, *reconstruction_gpu, *gradient_filter_in_x, *gradient_filter_in_y, *sx, *sy;
+void Reconstruct(float* focus_metric,
+                 short* index_of_max_focus_metric,
+                 float* min_intensity_cpu,
+                 short* index_of_min_intensity,
+                 float* hologram_cpu, 
+			     double* reconstruction_z_depths,
+                 const int num_z_depths,
+                 const int M,
+                 const int N, 
+				 const double wavelength,
+                 const double pixel_size,
+				 const float power_filter_order,
+                 const float power_filter_offset,
+				 const float steerable_filter_sigma,
+                 const float maximum_intensity,
+				 float* intensity_at_best_focus_cpu,
+                 bool record_min_intensity,
+                 bool record_intensity_at_best_focus) {
+	float* hologram_gpu;
+    float* min_intensity_gpu;
+    float* max_sim_focus_metric_gpu;
+    float* gradient_magnitude_gpu;
+    float* image_magnitude;
+    float* sim;
+    float* intensity_at_best_focus_gpu;
+	short* index_of_min_intensity_gpu;
+    short* index_of_max_focus_metric_gpu;
+	float2* complex_hologram_gpu;
+    float2* reconstruction_gpu;
+    float2* gradient_filter_in_x;
+    float2* gradient_filter_in_y;
+    float2* gradient_response_in_x_gpu;
+    float2* gradient_response_in_y_gpu;
 	float adudu, cutoff2, fftscale;
 	float2 offsetPhaseExp;
 	float sigma;
+    //...for both x and y dims in the block
+    const int kBlockSize = 16;
 
     // A block is the number of threads which are launched at each round. A size
-    // of 16x16 is used to step through the image 256 threads at a time.
-	dim3 myblock(16, 16);
-    // TODO(nloomis): doc
-	dim3 mygrid( roundUpDiv(N,16), roundUpDiv(M,16) );
+    // of 16x16 is used to step through the image 256 threads at a time. For
+    // CUDA (as of 2010), threads are launched internally in multiples of 16,
+    // so I used a multiple of 16 here for better processing. The exact size and
+    // shape were not optimized.
+	dim3 myblock(kBlockSize, kBlockSize);
 
-	mexPrintf("Uploading hologram\n");
+    // A grid describes to the GPU how many times it should launch thread
+    // blocks of a given size. There are enough grids so that one thread is
+    // launched for every pixel. If N or M are not evenly divisible by the block
+    // size, there will be more threads launched than pixels (due to the limited
+    // granularity the GPU gives in its thread blocks), so the kernels all
+    // include tests to make sure its thread corresponds to a pixel.
+	dim3 mygrid( roundUpDiv(N, kBlockSize), roundUpDiv(M, kBlockSize) );
 
-	//upload the hologram and convert it to a complex-valued matrix
-	cudaMalloc( (void**)&hologram_gpu, sizeof(float)*M*N);
-	cudaMalloc( (void**)&chologram_gpu, sizeof(float2)*M*N);
-	cudaMemcpy( hologram_gpu, hologram_cpu, sizeof(float)*M*N, cudaMemcpyHostToDevice);
-	float_to_complexKernel<<<mygrid, myblock>>>(chologram_gpu, hologram_gpu, M, N);
+	// Upload the hologram to the GPU's memory.
+    mexPrintf("Uploading hologram\n");
+	cudaMalloc((void**) &hologram_gpu, sizeof(float) * M * N);
+    cudaMemcpy(hologram_gpu,
+               hologram_cpu,
+               sizeof(float) * M * N,
+               cudaMemcpyHostToDevice);
+
+    // Convert the hologram from real-valued floats to complex-valued floats.
+    // This is needed because we need the complex-valued FFT for computing the
+    // physical wave propagation.
+	cudaMalloc((void**) &complex_hologram_gpu, sizeof(float2) * M * N);
+	FloatToComplexKernel<<<mygrid, myblock>>>(complex_hologram_gpu,
+                                              hologram_gpu,
+                                              M, N);
+    // After the FFT is computed, the original source data does not need to be
+    // maintained on the GPU.
 	cudaFree(hologram_gpu);
 
-	mexPrintf("Creating memory on GPU\n");
-
-	//create variables to track the max focus_metric, min int
-	cudaMalloc( (void**)&simmaxdev, sizeof(float)*M*N);
-	cudaMalloc( (void**)&index_of_max_focus_metric_gpu, sizeof(short)*M*N);
-	cudaMemset(index_of_max_focus_metric_gpu, 0, sizeof(short)*M*N);
-	//fillFloatKernel<<<mygrid, myblock>>>(min_intensity_gpu, FLT_MIN, M, N); //don't need this
-	if (rintmode){
-		cudaMalloc( (void**)&min_intensity_gpu, sizeof(float)*M*N);
-		cudaMalloc( (void**)&index_of_min_intensity_gpu, sizeof(short)*M*N);
-		cudaMemset(index_of_min_intensity_gpu, 0, sizeof(short)*M*N);
+	// Allocate memory for the remaining variables in the GPU.
+    mexPrintf("Creating memory on GPU\n");
+	cudaMalloc((void**) &max_sim_focus_metric_gpu, sizeof(float) * M * N);
+	cudaMalloc((void**) &index_of_max_focus_metric_gpu, sizeof(short) * M * N);
+	cudaMemset(index_of_max_focus_metric_gpu, 0, sizeof(short) * M * N);
+	if (record_min_intensity){
+		cudaMalloc((void**) &min_intensity_gpu, sizeof(float) * M * N);
+		cudaMalloc((void**) &index_of_min_intensity_gpu, sizeof(short) * M * N);
+		cudaMemset(index_of_min_intensity_gpu, 0, sizeof(short) * M * N);
 	}
 
-	mexPrintf("Creating FFT plan\n");
-
-	//create an FFT plan
+	// Create an FFT plan. The plan tells the GPU how to compute a Fourier
+    // transform, its dimensionality, and the complexity. There is a TINY
+    // amount of overhead while CUDA "plans" (optimizes) the computation, so
+    // that it will work extremely fast later. The plan is meant to be re-used.
+    mexPrintf("Creating FFT plan\n");
 	cufftHandle plan;
+    // CUFFT_C2C indicates that the transform is from complex-valued data and
+    // that the results should be stored as complex-valued.
 	cufftPlan2d(&plan, N, M, CUFFT_C2C);
 
+    // Compute the 2D FFT of the hologram data, in place, yielding the spatial
+    // frequencies of the image.
 	mexPrintf("Executing FFT\n");
-	
-	//compute the (power-modulated) spectra, which will be used for each reconstruction step
-	//take the FFT of the hologram data
-	cufftExecC2C(plan, chologram_gpu, chologram_gpu, CUFFT_FORWARD);
+    // CUFFT_FORWARD indicates that this transform is a forward Fourier
+    // transform (not an inverese FFT).
+	cufftExecC2C(plan,
+                 complex_hologram_gpu,
+                 complex_hologram_gpu,
+                 CUFFT_FORWARD);
 
+// TODO(nloomis): explain sigma on power filter; finish docs for power filter
+
+    // Holograms may be captured using a monochrome sensor or a sensor with a
+    // Bayer filter. In the Bayer'ed holograms, the effect of the color filter
+    // manifests itself as replicated spectra at the Nyquist frequencies. A
+    // power filter acts as a low-pass filter with a smooth transition at a
+    // controllable rate and location in the frequency domain.
 	mexPrintf("Applying power filter\n");
-
-	//apply the power kernel filter
+    // Cheap trick: if power_filter_order is negative, the filter isn't applied.
 	if (power_filter_order > 0) {
-		//mexPrintf("Applying power kernel\n");
-		sigma = -1.0f/log(power_filter_offset);
-		PowerKernel<<<mygrid, myblock>>>(chologram_gpu, N, M,
+		// mexPrintf("Applying power kernel\n");
+		sigma = -1.0f / log(power_filter_offset);
+		PowerKernel<<<mygrid, myblock>>>(complex_hologram_gpu, N, M,
 			power_filter_order, power_filter_offset, sigma);
 	}
 
-	mexPrintf("Computing steerable filter\n");
-
-	//compute the steerable filter, used for each reconstruction step
+    // Compute the steerable filter, a gradient filter with smoothing. The
+    // gradient filter is applied to each reconstructed slice.
+    mexPrintf("Computing steerable filter\n");
 	cudaMalloc((void**) &gradient_filter_in_x, sizeof(float2) * M * N);
 	cudaMalloc((void**) &gradient_filter_in_y, sizeof(float2) * M * N);
-	fillSfiltxKernel<<<mygrid, myblock>>>(gradient_filter_in_x, steerable_filter_sigma, M, N);
-	fillSfiltyKernel<<<mygrid, myblock>>>(gradient_filter_in_y, steerable_filter_sigma, M, N);
-	cufftExecC2C(plan, gradient_filter_in_x, gradient_filter_in_x, CUFFT_FORWARD); //compute the freq-domain version of the filter
-	cufftExecC2C(plan, gradient_filter_in_y, gradient_filter_in_y, CUFFT_FORWARD);
-	//..and reserve memory for the resulting sx, sy gradients
-	cudaMalloc((void**) &sx, sizeof(float2) * M * N);
-	cudaMalloc((void**) &sy, sizeof(float2) * M * N);
+	ComputeSteerableFilterXCoefsKernel<<<mygrid, myblock>>>(
+        gradient_filter_in_x,
+        steerable_filter_sigma,
+        M, N);
+	ComputeSteerableFilterYCoefsKernel<<<mygrid, myblock>>>(
+        gradient_filter_in_y,
+        steerable_filter_sigma,
+        M, N);
+
+    // Compute the filter's frequency-domain response. This makes it easy to
+    // apply the filter later: instead of a slow spatial convolution, we can do
+    // a point-wise multiplication in the Fourier domain and take the inverse
+    // 2D FFT.
+    // The forward 2D FFTs are performed in-place.
+	cufftExecC2C(plan,
+                 gradient_filter_in_x,
+                 gradient_filter_in_x,
+                 CUFFT_FORWARD);
+	cufftExecC2C(plan,
+                 gradient_filter_in_y,
+                 gradient_filter_in_y,
+                 CUFFT_FORWARD);
+    // Reserve memory for the gradient response in each direction and the 
+    // magnitude of the gradient response.
+	cudaMalloc((void**) &gradient_response_in_x_gpu, sizeof(float2) * M * N);
+	cudaMalloc((void**) &gradient_response_in_y_gpu, sizeof(float2) * M * N);
 	cudaMalloc((void**) &gradient_magnitude_gpu, sizeof(float) * M * N);
 
 
-
-	//reserve memory for the reconstruction
+	// Reserve memory for a single reconstructed slice of the volume.
 	cudaMalloc( (void**)&reconstruction_gpu, sizeof(float2) * M * N);
 
 
@@ -619,18 +747,16 @@ void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* m
 	if (record_intensity_at_best_focus)
 		cudaMalloc( (void**)&intensity_at_best_focus_gpu, sizeof(float) * M * N);
 
-	//fillFloatKernel<<<mygrid, myblock>>>(image_magnitude, 1.0f, M, N); //don't need this
-
 	mexPrintf("Computing reconstructions\n");
 
 	//reconstruct the hologram at each depth in z, compare it to the previous
 	//minimum intensity
-	for (int i=0; i<nz; i++){
+	for (int slice_index = 0; slice_index < num_z_depths; ++slice_index){
 		//copy the fft spectrum to a variable that's temporary for each plane
-		cudaMemcpy(reconstruction_gpu, chologram_gpu, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice);
+		cudaMemcpy(reconstruction_gpu, complex_hologram_gpu, sizeof(float2)*M*N, cudaMemcpyDeviceToDevice);
 
 		//set the propagation parameters
-		setPropagationParams( (float)(z[i]), (float)wavelength, (float)pixel_size, M, N, 
+		setPropagationParams( (float)(reconstruction_z_depths[slice_index]), (float)wavelength, (float)pixel_size, M, N, 
 			&adudu, &cutoff2, &offsetPhaseExp, &fftscale, false);
 
 		//apply the propagation kernel (full... could speed this up by ignoring cutoff)
@@ -644,16 +770,16 @@ void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* m
 		computeMagKernel<<<mygrid, myblock>>>(reconstruction_gpu, M, N);
 
 		//compute the steerable gradient responses in the x and y directions
-		cudaMemcpy( sx, reconstruction_gpu, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the magnitude info
-		cufftExecC2C(plan, sx, sx, CUFFT_FORWARD); //the spectrum of the magnitude
-		cudaMemcpy( sy, sx, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the spectrum information
+		cudaMemcpy(gradient_response_in_x_gpu, reconstruction_gpu, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the magnitude info
+		cufftExecC2C(plan, gradient_response_in_x_gpu, gradient_response_in_x_gpu, CUFFT_FORWARD); //the spectrum of the magnitude
+		cudaMemcpy(gradient_response_in_y_gpu, gradient_response_in_x_gpu, sizeof(float2) * M * N, cudaMemcpyDeviceToDevice); //copy the spectrum information
 		//apply the sfilt kernels in the x and y directions
-		ComplexMultiplicationKernel<<<mygrid, myblock>>>(sx, sx, gradient_filter_in_x, M, N);
-		ComplexMultiplicationKernel<<<mygrid, myblock>>>(sy, sy, gradient_filter_in_y, M, N);
-		cufftExecC2C(plan, sx, sx, CUFFT_INVERSE);
-		cufftExecC2C(plan, sy, sy, CUFFT_INVERSE);
+		ComplexMultiplicationKernel<<<mygrid, myblock>>>(gradient_response_in_x_gpu, gradient_response_in_x_gpu, gradient_filter_in_x, M, N);
+		ComplexMultiplicationKernel<<<mygrid, myblock>>>(gradient_response_in_y_gpu, gradient_response_in_y_gpu, gradient_filter_in_y, M, N);
+		cufftExecC2C(plan, gradient_response_in_x_gpu, gradient_response_in_x_gpu, CUFFT_INVERSE);
+		cufftExecC2C(plan, gradient_response_in_y_gpu, gradient_response_in_y_gpu, CUFFT_INVERSE);
 		//finally: compute the magnitude and orientation
-		GradientMagnitudeKernel<<<mygrid,myblock>>>(gradient_magnitude_gpu, sx, sy, M, N);
+		GradientMagnitudeKernel<<<mygrid,myblock>>>(gradient_magnitude_gpu, gradient_response_in_x_gpu, gradient_response_in_y_gpu, M, N);
 		scaleFloatKernel<<<mygrid,myblock>>>(gradient_magnitude_gpu, 1.0f / ((float) (M * M) * (float) (N * N)), M, N);
 
 		//find the local min intensity (for focus_metric)
@@ -665,55 +791,66 @@ void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* m
 		computeSIMkernel<<<mygrid, myblock>>>(sim, gradient_magnitude_gpu, image_magnitude, maximum_intensity, M, N);
 		
 
-		if (rintmode){
+		if (record_min_intensity){
 			//compare the current intensity to the previous minimum
-			if (i == 0) 
-				copyRealKernel<<<mygrid,myblock>>>(min_intensity_gpu, reconstruction_gpu, M, N);
-			else 
-				compareReal2Kernel<<<mygrid, myblock>>>(min_intensity_gpu, index_of_min_intensity_gpu, reconstruction_gpu, i, M, N);
+			if (slice_index == 0)
+                // If this is the first slice to be reconstructed, copy the
+                // reconstruction values as initial values.
+				copyRealKernel<<<mygrid, myblock>>>(min_intensity_gpu,
+                                                    reconstruction_gpu,
+                                                    M, N);
+			else
+                // Compare this reconstructed slice's intensity against the
+                // previously recorded minimum intensity; pixels which have
+                // lower intensities for this slice replace the values in
+                // min_intensity_gpu and index_of_min_intensity_gpu. 
+				compareReal2Kernel<<<mygrid, myblock>>>
+                   (min_intensity_gpu,
+                    index_of_min_intensity_gpu, 
+                    reconstruction_gpu, 
+                    slice_index, 
+                    M, N);
 		}
 
 		//compare the current SIM to the previous SIMs
-		if (i == 0) {
-			cudaMemcpy(simmaxdev, sim, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
+		if (slice_index == 0) {
+			cudaMemcpy(max_sim_focus_metric_gpu, sim, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
 			if (record_intensity_at_best_focus)
-				cudaMemcpy(intensity_at_best_focus_gpu, min_intensity_gpu, sizeof(float)*M*N, cudaMemcpyDeviceToDevice);
+				cudaMemcpy(intensity_at_best_focus_gpu, min_intensity_gpu, sizeof(float) * M * N, cudaMemcpyDeviceToDevice);
 		}
 		else {
 			if (!record_intensity_at_best_focus)
 				compareRealKernel<<<mygrid, myblock>>>(
-                    simmaxdev, 
+                    max_sim_focus_metric_gpu, 
                     index_of_max_focus_metric_gpu,
                     sim,
-                    i, 
+                    slice_index, 
                     M, N);
 			else //record_intensity_at_best_focus == true
 				compareRealKernel<<<mygrid, myblock>>>(
-                    simmaxdev,
+                    max_sim_focus_metric_gpu,
                     index_of_max_focus_metric_gpu, 
                     sim, 
                     intensity_at_best_focus_gpu, 
                     reconstruction_gpu, 
-                    i, 
+                    slice_index, 
                     M, N);
 		}
-
-
 	}
 
 	// C-style indexing uses 0 as its first element, while Matlab uses 1 for its
     // first element. Add a 1 to all the slice indices recorded so that the
     // returned indices are directly usable in Matlab.
-	if (rintmode)
+	if (record_min_intensity)
 		AddShortsKernel<<<mygrid, myblock>>>(index_of_min_intensity_gpu, 1, M, N);
 	AddShortsKernel<<<mygrid, myblock>>>(
         index_of_max_focus_metric_gpu, 1, M, N);
 
     // Copy results from the GPU back to the CPU memory.
 	mexPrintf("Copying results back to host\n");
-	cudaMemcpy(focus_metric, simmaxdev, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+	cudaMemcpy(focus_metric, max_sim_focus_metric_gpu, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
 	cudaMemcpy(index_of_max_focus_metric, index_of_max_focus_metric_gpu, sizeof(short) * M * N, cudaMemcpyDeviceToHost);
-	if (rintmode) {
+	if (record_min_intensity) {
 		cudaMemcpy(min_intensity_cpu, min_intensity_gpu, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
 		cudaMemcpy(index_of_min_intensity, index_of_min_intensity_gpu, sizeof(short) * M * N, cudaMemcpyDeviceToHost);
 	}
@@ -724,21 +861,21 @@ void reconstruct(float* focus_metric, short* index_of_max_focus_metric, float* m
 
 	//clean up!
 	cufftDestroy(plan);
-	cudaFree(chologram_gpu);
+	cudaFree(complex_hologram_gpu);
 	cudaFree(reconstruction_gpu);
-	if (rintmode){
+	if (record_min_intensity){
 		cudaFree(min_intensity_gpu);
 		cudaFree(index_of_min_intensity_gpu);
 	}
 	cudaFree(gradient_filter_in_x);
 	cudaFree(gradient_filter_in_y);
-	cudaFree(sx);
-	cudaFree(sy);
+	cudaFree(gradient_response_in_x_gpu);
+	cudaFree(gradient_response_in_y_gpu);
 	cudaFree(gradient_magnitude_gpu);
 	cudaFree(sim);
 	cudaFree(image_magnitude);
 	cudaFree(index_of_max_focus_metric_gpu);
-	cudaFree(simmaxdev);
+	cudaFree(max_sim_focus_metric_gpu);
 	if (record_intensity_at_best_focus)
 		cudaFree(intensity_at_best_focus_gpu);
 }
@@ -755,22 +892,41 @@ void mexFunction( int nlhs, mxArray* plhs[],
     // Minimum reconstruction intensity.
     float* min_intensity_cpu;
     // Stores a metric for how well each hologram pixel can be focused.
-    float* focus_metric;
+    float* sim_focus_metric;
+    // Stores the reconstructed image's intensity at the best focus.
     float* intensity_at_best_focus_cpu = NULL;
     // Pointer for source hologram data, if it is passed in as a double.
 	double* dsrc;
     // Pointer for source hologram data, if it is passed in as an unsigned char.
 	unsigned char* isrc;
+    // Index of the slice which has the minimum intensity at that pixel; array
+    // the same size as hologram_cpu.
 	short* index_of_min_intensity;
+    // Index of the slice which has the maximum focus metric at that pixel;
+    // array the same size as hologram_cpu.
     short* index_of_max_focus_metric;
-	double* z;
+    // Array of depths to reconstruct, in meters.
+	double* reconstruction_z_depths;
     // Wavelength of the illumination light in meters.
     double wavelength = 658e-9;
     // Size of a camera pixel in meters.
     double pixel_size = 9e-6;
-	int M, N, nz;
-	float power_filter_order = -1, power_filter_offset = .001, sigma = 2, maximum_intensity = 1000;
-	bool rintmode, record_intensity_at_best_focus;
+    // Number of rows in hologram_cpu and any other array which has the same
+    // size (hint: most of the arrays have the same size).
+	int M;
+    // Number of columns in hologram_cpu and any other array which has the
+    // same size.
+    int N;
+    // Number of depths to reconstruct; size of z.
+    int num_z_depths;
+	float power_filter_order = -1;
+    float power_filter_offset = .001;
+    float sigma = 2;
+    float maximum_intensity = 1000;
+	bool record_min_intensity;
+    // If true, the reconstruction intensity is recorded at each pixel for the
+    // slice that best focuses that pixel.
+    bool record_intensity_at_best_focus;
 
 	if (nrhs<2)
 		mexErrMsgTxt("maxSIMfm(image, z, [wavelength], [pixel_size]) requires at least two arguments.");
@@ -784,10 +940,10 @@ void mexFunction( int nlhs, mxArray* plhs[],
 	//C is column-wise ordering (column-major)
 	
 	//retrieve the depths at which to do reconstructions
-	z = mxGetPr(prhs[1]);
-	nz = mxGetM(prhs[1]) * mxGetN(prhs[1]);
+	reconstruction_z_depths = mxGetPr(prhs[1]);
+	num_z_depths = mxGetM(prhs[1]) * mxGetN(prhs[1]);
 	
-	//mexPrintf("M: %i, N: %i, nz: %i\n", M, N, nz);
+	//mexPrintf("M: %i, N: %i, num_z_depths: %i\n", M, N, num_z_depths);
 
 	//get optional parameters; use defaults otherwise
 	if (nrhs>=3)
@@ -840,9 +996,9 @@ void mexFunction( int nlhs, mxArray* plhs[],
 	//create outputs
 	
 	if (nlhs > 2)
-		rintmode = true;
+		record_min_intensity = true;
 	else
-		rintmode = false;
+		record_min_intensity = false;
 	if (nlhs > 4)
 		record_intensity_at_best_focus = true;
 	else
@@ -853,7 +1009,7 @@ void mexFunction( int nlhs, mxArray* plhs[],
 	focus_metric = (float*) mxGetPr(plhs[0]);
 	index_of_max_focus_metric = (short*) mxGetPr(plhs[1]);
 
-	if (rintmode) {
+	if (record_min_intensity) {
 		plhs[2] = mxCreateNumericMatrix(N, M, mxSINGLE_CLASS, mxREAL);
 		plhs[3] = mxCreateNumericMatrix(N, M, mxINT16_CLASS, mxREAL);
 		min_intensity_cpu = (float*) mxGetPr(plhs[2]); //single
@@ -866,8 +1022,17 @@ void mexFunction( int nlhs, mxArray* plhs[],
 	}
 
 	//reconstruct hologram and find mins
-	reconstruct(SIM, index_of_max_focus_metric, min_intensity_cpu, index_of_min_intensity, hologram_cpu, z, nz, M, N, wavelength, pixel_size, 
-		power_filter_order, power_filter_offset, sigma, maximum_intensity, intensity_at_best_focus_cpu, rintmode, record_intensity_at_best_focus);
+	Reconstruct(sim_focus_metric, index_of_max_focus_metric,
+                min_intensity_cpu, index_of_min_intensity,
+                hologram_cpu,
+                reconstruction_z_depths, num_z_depths,
+                M, N,
+                wavelength, pixel_size, 
+		        power_filter_order, power_filter_offset,
+                sigma,
+                maximum_intensity, intensity_at_best_focus_cpu,
+                record_min_intensity,
+                record_intensity_at_best_focus);
 
 	// If the hologram was originally passed in as a double or unsigned chars,
 	// hologram_cpu would have been malloc'd. Free it now, before exiting.
